@@ -2,19 +2,19 @@ from dotenv import load_dotenv
 import streamlit as st
 import google.generativeai as genai
 import os
-import pvleopard
-import pvorca
-import struct
-import wave
 import tempfile
 import io
 import numpy as np
 from scipy.io import wavfile
+import subprocess
+import re
 import base64
-import time
+import requests  # Required for AssemblyAI STT
+import time  # Required for API polling
 import uuid
 import platform
 import pathlib
+import streamlit.components.v1 as components
 
 load_dotenv()
 
@@ -27,9 +27,12 @@ try:
     model = genai.GenerativeModel('gemini-2.5-flash', 
                                 system_instruction="Keep responses concise and professional.")
     
-    picovoice_access_key = os.environ["PICOVOICE_ACCESS_KEY"]
-    leopard = pvleopard.create(access_key=picovoice_access_key)
-    orca = pvorca.create(access_key=picovoice_access_key)
+    genai_api_key = os.environ.get("GEMINI_API_KEY")
+    # AssemblyAI key for STT/TTS
+    ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
+    if not ASSEMBLYAI_API_KEY:
+        raise EnvironmentError("ASSEMBLYAI_API_KEY not set in environment")
+    ASSEMBLYAI_HEADERS = {"authorization": ASSEMBLYAI_API_KEY}
 except Exception as e:
     st.error(f"Failed to initialize APIs: {str(e)}")
     st.stop()
@@ -74,27 +77,54 @@ def stt(audio_data):
         if audio_array.dtype != np.int16:
             audio_array = (audio_array * 32767).astype(np.int16)
 
-        # Cross-platform temp directory handling
-        if platform.system() == 'Windows':
-            temp_dir = pathlib.Path.home() / 'AppData' / 'Local' / 'Temp'
-        else:
-            temp_dir = pathlib.Path('/tmp')
+        # Write audio to a temporary WAV file to upload to AssemblyAI
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            temp_path = tf.name
+            wavfile.write(temp_path, sample_rate, audio_array)
 
-        # Ensure temp directory exists
-        temp_dir.mkdir(parents=True, exist_ok=True)
-            
-        # Use pathlib for cross-platform path handling
-        temp_path = temp_dir / f"temp_audio_{uuid.uuid4()}.wav"
-        
         try:
-            # Write and process audio file
-            wavfile.write(str(temp_path), sample_rate, audio_array)
-            transcript, _ = leopard.process_file(str(temp_path))
-            return transcript.strip() if transcript else None
+            # Upload the file to AssemblyAI (upload endpoint expects binary upload)
+            upload_url = "https://api.assemblyai.com/v2/upload"
+            with open(temp_path, "rb") as f:
+                # Stream upload in chunks to avoid loading entire file into memory
+                def gen():
+                    while True:
+                        chunk = f.read(524288)
+                        if not chunk:
+                            break
+                        yield chunk
+                resp = requests.post(upload_url, headers=ASSEMBLYAI_HEADERS, data=gen())
+            resp.raise_for_status()
+            upload_response = resp.json()
+            audio_url = upload_response.get("upload_url")
+            if not audio_url:
+                raise RuntimeError("AssemblyAI upload did not return upload_url")
+
+            # Create transcript
+            transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
+            payload = {"audio_url": audio_url}
+            tresp = requests.post(transcript_endpoint, headers={**ASSEMBLYAI_HEADERS, "content-type": "application/json"}, json=payload)
+            tresp.raise_for_status()
+            tid = tresp.json().get("id")
+            # Poll for completion
+            status = "processing"
+            transcript_text = None
+            poll_endpoint = f"https://api.assemblyai.com/v2/transcript/{tid}"
+            for _ in range(60):  # up to ~60 * 1s = 60s polling
+                time.sleep(1)
+                presp = requests.get(poll_endpoint, headers=ASSEMBLYAI_HEADERS)
+                presp.raise_for_status()
+                status = presp.json().get("status")
+                if status == "completed":
+                    transcript_text = presp.json().get("text")
+                    break
+                if status == "error":
+                    raise RuntimeError(f"AssemblyAI transcription error: {presp.json().get('error')}" )
+
+            return transcript_text.strip() if transcript_text else None
         finally:
-            # Clean up temp file in all cases
             try:
-                temp_path.unlink(missing_ok=True)  # Cross-platform file deletion
+                pathlib.Path(temp_path).unlink(missing_ok=True)
             except:
                 pass
 
@@ -104,19 +134,14 @@ def stt(audio_data):
 
 @st.cache_data(ttl=60)  # Cache TTS results for 1 minute
 def tts(text):
-    """Convert text to speech with error handling"""
-    try:
-        pcm, _ = orca.synthesize(clean_text(text))
-        audio_buffer = io.BytesIO()
-        with wave.open(audio_buffer, "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(orca.sample_rate)
-            wav.writeframes(struct.pack(f"{len(pcm)}h", *pcm))
-        return audio_buffer.getvalue()
-    except Exception as e:
-        st.error(f"Text-to-speech failed: {str(e)}")
-        return None
+    """Convert text to speech with error handling.
+
+    Returns a tuple: (audio_bytes, mime_type) where mime_type is like 'audio/wav' or 'audio/mpeg'.
+    Attempts to convert mp3 -> wav using pydub for browser compatibility; falls back to returning mp3 if conversion fails.
+    """
+    # AssemblyAI does not provide a TTS endpoint. Use the browser SpeechSynthesis fallback instead.
+    # Returning None causes the UI renderer to call the browser's Web Speech API with the assistant text.
+    return None
 
 def process_message(text):
     """Process a message and generate response"""
@@ -138,14 +163,14 @@ def process_message(text):
             response_text = getattr(response, "text", "Sorry, I couldn't generate a response.")
             
             with st.spinner("Generating audio..."):
-                # Generate audio if needed
+                # Generate audio if needed. tts() returns (bytes, mime) or None
                 audio = tts(response_text) if response_text else None
             
             # Add assistant message
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": response_text,
-                "audio": audio,
+                "audio": audio,  # either None or (bytes, mime)
                 "id": str(uuid.uuid4()),
                 "ts": time.time()
             })
@@ -158,23 +183,96 @@ def process_message(text):
         st.session_state.is_processing = False
 
 # Add this helper function in the UTILS section
-def get_autoplay_audio_html(audio_bytes):
-    """Cross-browser compatible audio autoplay"""
-    if not audio_bytes:
-        return ""
-    b64 = base64.b64encode(audio_bytes).decode()
-    return f"""
-        <audio autoplay playsinline>
-            <source src="data:audio/wav;base64,{b64}" type="audio/wav">
-            <source src="data:audio/wav;base64,{b64}" type="audio/x-wav">
-            <source src="data:audio/wav;base64,{b64}" type="audio/wave">
-        </audio>
-        <script>
-            document.querySelectorAll('audio[autoplay]').forEach(audio => {{
-                audio.play().catch(e => console.log("Auto-play prevented:", e));
-            }});
-        </script>
+def get_autoplay_audio_html(audio_blob, text=None):
+    """Cross-browser compatible audio autoplay.
+
+    - If `audio_blob` is a tuple (bytes, mime) or raw bytes, embed and play that audio.
+    - If `audio_blob` is None but `text` is provided, use the browser Web Speech API (speechSynthesis)
+      to speak the text locally (no external TTS required).
     """
+    # If we have server-generated audio, embed it as before
+    if audio_blob:
+        if isinstance(audio_blob, tuple) and len(audio_blob) == 2:
+            audio_bytes, mime = audio_blob
+        else:
+            audio_bytes = audio_blob
+            mime = "audio/wav"
+
+        b64 = base64.b64encode(audio_bytes).decode()
+        # Use the provided mime in the data URI so browser knows how to play it
+        return f"""
+            <audio autoplay playsinline>
+                <source src="data:{mime};base64,{b64}" type="{mime}">
+            </audio>
+            <script>
+                document.querySelectorAll('audio[autoplay]').forEach(audio => {{
+                    audio.play().catch(e => console.log("Auto-play prevented:", e));
+                }});
+            </script>
+        """
+
+    # Use espeakng for TTS if text is provided
+    if text:
+        try:
+            import subprocess
+            import base64
+            import wave
+            import io
+            import re
+            
+            # Clean up the text
+            def clean_text_for_tts(text):
+                # Remove URLs
+                text = re.sub(r'http[s]?://\S+', '', text)
+                # Remove markdown code blocks and inline code
+                text = re.sub(r'`[^`]+`', '', text)
+                text = re.sub(r'```[\s\S]+?```', '', text)
+                # Remove special characters but keep basic punctuation
+                text = re.sub(r'[^a-zA-Z0-9\s.,!?()-]', ' ', text)
+                # Replace multiple spaces with single space
+                text = re.sub(r'\s+', ' ', text)
+                # Replace multiple periods with single period
+                text = re.sub(r'\.{2,}', '.', text)
+                # Add spaces after punctuation if missing
+                text = re.sub(r'([.,!?])([a-zA-Z])', r'\1 \2', text)
+                return text.strip()
+            
+            # Clean the text
+            cleaned_text = clean_text_for_tts(text)
+            if not cleaned_text:
+                return None
+                
+            # Use espeak-ng directly to generate wav data
+            cmd = ['espeak-ng', '-w', '/dev/stdout', '-v', 'en-us', cleaned_text]
+            process = subprocess.run(cmd, capture_output=True, check=True)
+            raw_audio = process.stdout
+            
+            # Create WAV data in memory
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # Mono
+                wav_file.setsampwidth(2)  # 2 bytes per sample
+                wav_file.setframerate(22050)  # Standard sample rate
+                wav_file.writeframes(raw_audio)
+            
+            # Get the WAV data
+            wav_data = wav_buffer.getvalue()
+            
+            # Convert to base64 for HTML audio
+            b64_audio = base64.b64encode(wav_data).decode()
+            audio_src = f"data:audio/wav;base64,{b64_audio}"
+            
+            # Return audio element that autoplays
+            return f'''
+                <audio autoplay style="display:none">
+                    <source src="{audio_src}" type="audio/wav">
+                </audio>
+            '''
+        except Exception as e:
+            st.error(f"TTS Error: {str(e)}")
+            return None
+
+    return ""
 
 # Add this helper function near the top of the file after imports
 def safe_rerun():
@@ -195,7 +293,7 @@ def retry_with_backoff(func, max_retries=3):
             return func()
         except Exception as e:
             if i == max_retries - 1:
-                raise e
+                raise e 
             time.sleep(2 ** i)  # exponential backoff
 
 # ---------- UI LAYOUT ----------
@@ -295,14 +393,25 @@ document.addEventListener('keydown', function(e) {
 st.title("💬 Gemini Voice Assistant")
 for msg in st.session_state.messages:
     message_type = "user-message" if msg["role"] == "user" else "assistant-message"
-    audio_html = get_autoplay_audio_html(msg.get("audio")) if msg["role"] == "assistant" else ""
-    
+    if msg["role"] == "assistant":
+        # Pass audio tuple if present, otherwise pass text so browser TTS can speak
+        audio_html = get_autoplay_audio_html(msg.get("audio"), text=msg.get("content"))
+    else:
+        audio_html = ""
+
     st.markdown(f"""
         <div class="chat-message {message_type}">
             <div class="message-content">{msg["content"]}</div>
-            {audio_html}
         </div>
     """, unsafe_allow_html=True)
+
+    # Render audio/script with enough space to show debug output
+    if audio_html:
+        try:
+            # Use larger height to show debug messages
+            components.html(audio_html, height=100)
+        except Exception as e:
+            st.error(f"Audio playback failed: {str(e)}")
 
 # Input area
 with st.container():

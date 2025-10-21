@@ -1,0 +1,5 @@
+espeak-ng
+espeak-ng-data
+libespeak-ng1
+libpcaudio0
+libasound2
